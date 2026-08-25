@@ -251,8 +251,16 @@ function _runSublistr(domain, bruteforce, ports, jobId) {
         }
 
         try {
+          // Sublist3r n'écrit le fichier -o que s'il trouve au moins un
+          // sous-domaine. Exit code 0 + fichier absent = 0 résultats, pas
+          // une erreur.
           if (!fs.existsSync(outputFile)) {
-            jobs[jobId] = { status: 'error', error: 'No output file generated', startedAt: jobs[jobId].startedAt };
+            jobs[jobId] = {
+              status: 'done',
+              data: { domain, subdomains: [], count: 0 },
+              startedAt: jobs[jobId].startedAt
+            };
+            console.log(`[Job ${jobId}] Found 0 subdomains (no output file)`);
             return;
           }
 
