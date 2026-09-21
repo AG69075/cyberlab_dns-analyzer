@@ -2,7 +2,6 @@ FROM node:22-slim
 
 WORKDIR /app
 
-# Mise à jour complète du système + installation des paquets
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends dnsutils python3 python3-pip && \
