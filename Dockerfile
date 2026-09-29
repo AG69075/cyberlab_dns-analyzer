@@ -5,7 +5,7 @@ WORKDIR /app
 RUN apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends dnsutils python3 python3-pip && \
-    pip3 install --break-system-packages --no-cache-dir --upgrade sublist3r && \
+    pip3 install --break-system-packages --no-cache-dir sublist3r==1.0 && \
     apt-get purge -y --auto-remove python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
