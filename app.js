@@ -2,6 +2,7 @@ const express = require('express');
 const { execFileSync, execFile, spawn, exec } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
+const path = require('path');
 const net = require('net');
 const dns = require('dns').promises;
 const rateLimit = require('express-rate-limit');
@@ -91,16 +92,22 @@ app.use('/api', (req, res, next) => {
   next();
 });
 
-// Rate limiting - the /api routes shell out to dig / spawn sublist3r
-// processes, so unrestricted request volume is a direct resource-exhaustion
-// vector.
+// Rate limiting - only on the routes that actually shell out to dig / spawn
+// sublist3r, which is the real resource-exhaustion vector. Deliberately NOT
+// applied to /api/subdomains/status/:jobId: it's a plain in-memory read with
+// zero exec cost, but the Flutter client polls it every 10s for up to
+// ~20 min during a brute-force job - sharing one 30 req/min budget with the
+// expensive routes meant a single long-running job's own polling could
+// starve out its own next "Énumérer" click (and everyone else's) with a
+// 429, which isn't what this limiter was ever meant to guard against.
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
   limit: 30,
   standardHeaders: true,
   legacyHeaders: false,
 });
-app.use('/api', apiLimiter);
+app.use('/api/dns', apiLimiter);
+app.use('/api/subdomains/start', apiLimiter);
 
 // DNS Lookup
 app.post('/api/dns', (req, res) => {
@@ -593,55 +600,234 @@ async function probeAll(hosts) {
   return results;
 }
 
+// crt.sh (Certificate Transparency logs), queried directly. Sublist3r's
+// bundled "ssl" engine scrapes crt.sh's HTML search page and is unreliable
+// on domains with hundreds of certs (truncates, times out); most of
+// Sublist3r's other engines (google/bing/yahoo/baidu/ask scraping,
+// threatcrowd's long-dead API, netcraft's changed layout) are effectively
+// dead in 2026 too, so this direct JSON query is the actual bulk of what
+// passive enumeration finds today - confirmed 9 -> 127+ on a real domain.
+// crt.sh itself is a free, notoriously overloaded service though (observed
+// live: one request timed out completely, a retry took 13.5s to answer) -
+// one retry after a short backoff costs little against the 5 min job
+// budget and meaningfully cuts the odds of losing this source entirely to
+// a transient slow window.
+const CRTSH_TIMEOUT_MS = 20000;
+const CRTSH_RETRY_DELAY_MS = 3000;
+
+async function queryCrtShOnce(domain) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CRTSH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`https://crt.sh/?q=%25.${encodeURIComponent(domain)}&output=json`, {
+      signal: controller.signal,
+      headers: { 'User-Agent': 'cyberlab-dns-analyzer' },
+    });
+    if (!res.ok) return null;
+    const entries = await res.json();
+    const names = new Set();
+    for (const entry of entries) {
+      for (const raw of String(entry.name_value || '').split('\n')) {
+        const name = raw.trim().toLowerCase();
+        if (!name || name.startsWith('*.')) continue;
+        if (name !== domain && !name.endsWith(`.${domain}`)) continue;
+        if (HOSTNAME_RE.test(name)) names.add(name);
+      }
+    }
+    return [...names];
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function queryCrtSh(domain) {
+  const first = await queryCrtShOnce(domain);
+  if (first !== null) return first;
+
+  console.warn(`[crt.sh] first attempt failed for ${sanitizeForLog(domain)}, retrying once`);
+  await new Promise((r) => setTimeout(r, CRTSH_RETRY_DELAY_MS));
+
+  const second = await queryCrtShOnce(domain);
+  if (second !== null) return second;
+
+  console.warn(`[crt.sh] retry also failed for ${sanitizeForLog(domain)}`);
+  return [];
+}
+
+// --- DNS brute force (native, no Sublist3r/subbrute) -----------------------
+// Sublist3r's bundled `-b` (subbrute) was measured to be architecturally
+// broken for a bounded job: it sequentially "verifies" its ~986-entry
+// resolvers.txt (1 query each) before a single real lookup - timed at
+// ~1.6s/resolver, so verifying the full list alone takes ~26 min, already
+// past the 20 min job cap, and only ~18% of those resolvers even respond
+// (a list that hasn't been refreshed in years). Trimming that list doesn't
+// help either: subbrute wants ~16 live resolvers per worker and the app
+// runs 40 workers, so a short resolver list just starves them (confirmed:
+// 20 min at <1% CPU, zero results, instead of erroring - worse than before).
+// Replaced entirely with a plain Node-native brute force: `dns.Resolver`
+// against a handful of known-reliable public resolvers (no per-resolver
+// verification pass - if one is down, c-ares just fails over) and a curated
+// wordlist (subdomain-wordlist.txt), same cursor/worker-pool concurrency
+// pattern as probeAll() above. No exec/spawn, no 20-minute wait.
+const BRUTEFORCE_WORDLIST = fs
+  .readFileSync(path.join(__dirname, 'subdomain-wordlist.txt'), 'utf-8')
+  .split('\n')
+  .map((w) => w.trim())
+  .filter(Boolean);
+const BRUTEFORCE_CONCURRENCY = 50;
+const BRUTEFORCE_RESOLVERS = ['1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4', '9.9.9.9'];
+
+async function bruteForceSubdomains(domain) {
+  const resolver = new dns.Resolver();
+  resolver.setServers(BRUTEFORCE_RESOLVERS);
+
+  // Wildcard detection: if a random, surely-nonexistent label resolves, the
+  // domain has a `*.domain` record. Hosts whose A records all fall within
+  // that wildcard IP set are false positives and are dropped.
+  const wildcardIps = new Set();
+  try {
+    const probe = `wc-${Math.random().toString(36).slice(2, 12)}.${domain}`;
+    for (const ip of await resolver.resolve4(probe)) wildcardIps.add(ip);
+  } catch {
+    // no wildcard
+  }
+
+  const targets = BRUTEFORCE_WORDLIST.map((w) => `${w}.${domain}`);
+  const found = new Set();
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < targets.length) {
+      const host = targets[cursor++];
+      try {
+        const ips = await resolver.resolve4(host);
+        if (wildcardIps.size === 0 || ips.some((ip) => !wildcardIps.has(ip))) found.add(host);
+      } catch {
+        // NXDOMAIN / no answer / resolver hiccup - treated the same: this
+        // candidate name doesn't resolve, move on.
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(BRUTEFORCE_CONCURRENCY, targets.length) }, worker)
+  );
+  return [...found];
+}
+
 // --- Enumeration runner ---------------------------------------------------
-// Sublist3r (passive OSINT) + optional `-b` brute force (subbrute, ~2000
-// common names) + optional Node-side HTTP probe on the merged list.
+// Sublist3r (passive OSINT only - see below) + direct crt.sh query +
+// optional native DNS brute force (bruteForceSubdomains, above) + optional
+// Node-side HTTP probe on the merged list.
 function _runEnumeration(domain, opts, jobId) {
+  // Both kicked off immediately, independent of Python/Sublist3r entirely -
+  // crt.sh resolves in seconds and the native brute force (above) in well
+  // under a minute for its ~600-word list. If Sublist3r's own passive
+  // engines (several long-dead, see below) hang past the timeout, these
+  // must survive the kill instead of the whole job erroring with nothing.
+  const crtshPromise = queryCrtSh(domain);
+  const bruteforcePromise = opts.bruteforce ? bruteForceSubdomains(domain) : Promise.resolve([]);
+
+  // Both the normal completion path and the 20 min timeout path race to
+  // finalize the same job; `settled` makes sure only the first one wins
+  // (checked synchronously before either does any awaiting).
+  let settled = false;
+
+  async function finalize(uniqueSubdomains, meta) {
+    if (settled) return;
+    settled = true;
+
+    let results = null;
+    const stats = {
+      total: uniqueSubdomains.length,
+      sublist3r: meta.sublist3rCount,
+      crtsh: meta.crtshCount,
+      bruteforce: meta.bruteforceCount,
+    };
+
+    if (opts.probe && uniqueSubdomains.length > 0) {
+      console.log(`[Job ${jobId}] Probing ${Math.min(uniqueSubdomains.length, MAX_PROBE_HOSTS)} host(s) over HTTP`);
+      results = await probeAll(uniqueSubdomains);
+      stats.probed = results.length;
+      stats.alive = results.filter(r => r.addresses.length > 0).length;
+      stats.httpOk = results.filter(r => r.http && r.http.status < 400).length;
+    }
+
+    jobs[jobId] = {
+      status: 'done',
+      data: {
+        domain,
+        subdomains: uniqueSubdomains,   // kept for backward compatibility
+        count: uniqueSubdomains.length,
+        bruteforce: !!opts.bruteforce,
+        timedOut: !!meta.timedOut,
+        probe: !!opts.probe,
+        results,                        // null when probe disabled
+        stats,
+      },
+      startedAt: jobs[jobId].startedAt
+    };
+
+    console.log(`[Job ${jobId}] Found ${uniqueSubdomains.length} subdomains`);
+  }
+
+  function fail(message) {
+    if (settled) return;
+    settled = true;
+    jobs[jobId] = { status: 'error', error: message, startedAt: jobs[jobId].startedAt };
+  }
+
   exec('which python3', (error) => {
     if (error) {
-      jobs[jobId] = { status: 'error', error: 'python3 not found', startedAt: jobs[jobId].startedAt };
+      fail('python3 not found');
       return;
     }
 
     exec('python3 -c "import sublist3r"', (error) => {
       if (error) {
-        jobs[jobId] = { status: 'error', error: 'sublist3r not installed (pip3 install sublist3r)', startedAt: jobs[jobId].startedAt };
+        fail('sublist3r not installed (pip3 install sublist3r)');
         return;
       }
 
       const outputFile = `/tmp/sublist3r_${jobId}.txt`;
-      const args = ['-m', 'sublist3r', '-d', domain, '-o', outputFile];
+      // DNSdumpster est exclu : son scraper CSRF est cassé dans Sublist3r
+      // (IndexError dans get_csrftoken) et faisait échouer tout le job.
+      // Bruteforce is deliberately NOT passed here (`-b`) - Sublist3r's
+      // bundled subbrute is architecturally too slow for this job's time
+      // budget (see bruteForceSubdomains() above for the measurements);
+      // it's replaced entirely by the native DNS brute force kicked off in
+      // parallel below, independent of this Sublist3r process.
+      const args = ['-m', 'sublist3r', '-d', domain, '-o', outputFile,
+        '-e', 'baidu,yahoo,google,bing,ask,netcraft,virustotal,threatcrowd,ssl,passivedns'];
 
-      if (opts.bruteforce) {
-        // -b enables subbrute (bundled ~2000-name wordlist, with wildcard
-        // detection built in); -t caps its forked resolver workers.
-        args.push('-b', '-t', '40');
-      }
-
-      console.log(`[Job ${jobId}] Running: python3 ${args.join(' ')} (probe=${opts.probe})`);
+      console.log(`[Job ${jobId}] Running: python3 ${args.join(' ')} (bruteforce=${opts.bruteforce}, probe=${opts.probe})`);
 
       // detached: true makes this process the leader of its own process
-      // group, so the timeout handler below can kill the whole group
-      // (subbrute forks itself into dozens of worker processes for
-      // concurrent DNS resolution - killing only the top-level PID leaves
-      // those forks running as orphans indefinitely).
+      // group, so the timeout handler below can kill the whole group.
       const python = spawn('python3', args, { detached: true });
       let errorString = '';
+      let stdoutTail = '';
 
       python.stderr.on('data', (data) => {
         errorString += data.toString();
+      });
+      // Sublist3r imprime ses erreurs de moteur sur stdout : on en garde la fin.
+      python.stdout.on('data', (data) => {
+        stdoutTail = (stdoutTail + data.toString()).slice(-1500);
       });
 
       python.on('close', async (code) => {
         console.log(`[Job ${jobId}] Exited with code ${code}`);
 
-        if (code !== 0) {
-          jobs[jobId] = {
-            status: 'error',
-            error: errorString || 'Sublist3r failed',
-            startedAt: jobs[jobId].startedAt
-          };
-          return;
+        // Un moteur qui plante (traceback en stderr) ne doit pas jeter les
+        // résultats des autres, et crt.sh ne dépend pas de Sublist3r : on
+        // n'échoue le job que si Sublist3r a produit ni fichier ni process
+        // exploitable ET que crt.sh échoue aussi (vérifié plus bas).
+        const sublist3rFailed = code !== 0 && !fs.existsSync(outputFile);
+        if (sublist3rFailed) {
+          console.warn(`[Job ${jobId}] Sublist3r failed (code ${code}), falling back to crt.sh only`);
         }
 
         try {
@@ -672,56 +858,61 @@ function _runEnumeration(domain, opts, jobId) {
             uniqueSubdomains = [...new Set(subdomains)].sort();
           }
 
-          let results = null;
-          const stats = { total: uniqueSubdomains.length };
+          console.log(`[Job ${jobId}] Querying crt.sh for ${sanitizeForLog(domain)}`);
+          const [crtshSubdomains, bruteforceSubdomains] = await Promise.all([crtshPromise, bruteforcePromise]);
+          const sublist3rCount = uniqueSubdomains.length;
+          uniqueSubdomains = [...new Set([...uniqueSubdomains, ...crtshSubdomains, ...bruteforceSubdomains])].sort();
 
-          if (opts.probe && uniqueSubdomains.length > 0) {
-            console.log(`[Job ${jobId}] Probing ${Math.min(uniqueSubdomains.length, MAX_PROBE_HOSTS)} host(s) over HTTP`);
-            results = await probeAll(uniqueSubdomains);
-            stats.probed = results.length;
-            stats.alive = results.filter(r => r.addresses.length > 0).length;
-            stats.httpOk = results.filter(r => r.http && r.http.status < 400).length;
+          if (sublist3rFailed && uniqueSubdomains.length === 0) {
+            fail(errorString || `Sublist3r failed (code ${code}) ${stdoutTail.replace(/\x1b\[[0-9;]*m/g, '').trim()}`);
+            return;
           }
 
-          jobs[jobId] = {
-            status: 'done',
-            data: {
-              domain,
-              subdomains: uniqueSubdomains,   // kept for backward compatibility
-              count: uniqueSubdomains.length,
-              bruteforce: !!opts.bruteforce,
-              probe: !!opts.probe,
-              results,                        // null when probe disabled
-              stats,
-            },
-            startedAt: jobs[jobId].startedAt
-          };
-
-          console.log(`[Job ${jobId}] Found ${uniqueSubdomains.length} subdomains`);
+          await finalize(uniqueSubdomains, {
+            sublist3rCount,
+            crtshCount: crtshSubdomains.length,
+            bruteforceCount: bruteforceSubdomains.length,
+            timedOut: false,
+          });
         } catch (err) {
-          jobs[jobId] = { status: 'error', error: `Failed to process results: ${err.message}`, startedAt: jobs[jobId].startedAt };
+          fail(`Failed to process results: ${err.message}`);
         }
       });
 
       python.on('error', (error) => {
-        jobs[jobId] = { status: 'error', error: `Spawn error: ${error.message}`, startedAt: jobs[jobId].startedAt };
+        fail(`Spawn error: ${error.message}`);
       });
 
-      // 20 min timeout
-      setTimeout(() => {
-        if (jobs[jobId] && jobs[jobId].status === 'pending') {
-          // Negative PID targets the whole process group (see `detached:
-          // true` above), so subbrute's forked workers get reaped too -
-          // python.kill() alone only hits the top-level process.
-          try {
-            process.kill(-python.pid, 'SIGKILL');
-          } catch (err) {
-            python.kill('SIGKILL');
-          }
-          console.log(`[Job ${jobId}] Timed out after 20 minutes, process group killed`);
-          jobs[jobId] = { status: 'error', error: 'Timeout: scan exceeded 20 minutes', startedAt: jobs[jobId].startedAt };
+      // 5 min timeout. Neither crt.sh (own 20s timeout) nor the native brute
+      // force (well under a minute for its wordlist) should ever get close
+      // to this - it's purely a backstop against Sublist3r's own passive
+      // engines (several long-dead search-engine scrapers) hanging on a
+      // network fluke. If it fires, fall back to whatever crt.sh/brute force
+      // already found instead of erroring with nothing.
+      setTimeout(async () => {
+        if (settled || !jobs[jobId] || jobs[jobId].status !== 'pending') return;
+
+        try {
+          process.kill(-python.pid, 'SIGKILL');
+        } catch (err) {
+          python.kill('SIGKILL');
         }
-      }, 1200000);
+        console.log(`[Job ${jobId}] Timed out after 5 minutes, process group killed - falling back to crt.sh/brute force`);
+
+        const [crtshSubdomains, bruteforceSubdomains] = await Promise.all([crtshPromise, bruteforcePromise]);
+        const uniqueSubdomains = [...new Set([...crtshSubdomains, ...bruteforceSubdomains])].sort();
+        if (uniqueSubdomains.length === 0) {
+          fail('Timeout: scan exceeded 5 minutes');
+          return;
+        }
+
+        await finalize(uniqueSubdomains, {
+          sublist3rCount: 0,
+          crtshCount: crtshSubdomains.length,
+          bruteforceCount: bruteforceSubdomains.length,
+          timedOut: true,
+        });
+      }, 300000);
     });
   });
 }
