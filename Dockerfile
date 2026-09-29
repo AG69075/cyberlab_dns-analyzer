@@ -9,8 +9,8 @@ RUN apt-get update && \
     apt-get purge -y --auto-remove python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-COPY package.json .
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY app.js .
 COPY subdomain-wordlist.txt .
