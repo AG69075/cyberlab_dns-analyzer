@@ -25,12 +25,12 @@ Le backend n'expose **aucun port public**. `cloudflared` établit une connexion 
 |---|---|---|
 | `POST` | `/api/dns` | Requête DNS via `dig` (`domain`, `server`, `port`, `type`) |
 | `POST` | `/api/dns/posture` | Audit de posture de sécurité DNS en lecture seule (`domain`) : SPF, DMARC, DKIM, DNSSEC, CAA, MX, diversité NS. Retourne `checks[]` (sévérité `ok`/`warn`/`crit`/`info`) et un `score` agrégé |
-| `POST` | `/api/subdomains/start` | Lance une énumération de sous-domaines (Sublist3r) en tâche de fond (`domain`, `bruteforce`, `probe`), retourne un `job_id` |
+| `POST` | `/api/subdomains/start` | Lance une énumération de sous-domaines (Sublist3r passif + crt.sh) en tâche de fond (`domain`, `bruteforce`, `probe`), retourne un `job_id` |
 | `GET` | `/api/subdomains/status/:jobId` | Statut/résultat d'un job d'énumération (`pending` / `done` / `error`) |
 | `POST` | `/api/subdomains` | Déprécié : répond `410`, utiliser `/start` puis `/status/:jobId` |
 | `GET` | `/health` | Health check (pas d'auth requise, utilisé par Docker `HEALTHCHECK`) |
 
-Options de `/api/subdomains/start` : `bruteforce` active le brute force Sublist3r (`-b`) ; `probe` sonde ensuite les sous-domaines trouvés en HTTP(S) (titre, statut ; 400 hôtes max, 20 en parallèle, adresses privées ignorées) et ajoute `results` et `stats` au résultat.
+Options de `/api/subdomains/start` : `bruteforce` active un brute force DNS natif (wordlist `subdomain-wordlist.txt`, résolveurs publics, détection des wildcards ; timeout global 5 min avec repli sur crt.sh/brute force) ; `probe` sonde ensuite les sous-domaines trouvés en HTTP(S) (titre, statut ; 400 hôtes max, 20 en parallèle, adresses privées ignorées) et ajoute `results` et `stats` au résultat.
 
 Types d'enregistrement supportés : `A`, `AAAA`, `MX`, `TXT`, `CNAME`, `NS`, `PTR`, `AXFR`, `ANY`.
 
@@ -99,7 +99,7 @@ Ce service exécute des commandes système (`dig`, `sublist3r`) à partir d'entr
 - **Pas de shell** : `execFileSync`/`spawn` avec tableaux d'arguments, jamais de concaténation de chaîne shell.
 - **Validation stricte** en entrée : hostname/IP (`net.isIP` + regex hostname), port (1-65535), type d'enregistrement en liste blanche.
 - **Authentification** : token partagé requis sur `/api/*`, vérifié avant tout traitement.
-- **Rate limiting** : 30 requêtes/min sur `/api/*`.
+- **Rate limiting** : 30 requêtes/min sur `/api/dns` et `/api/subdomains/start` (pas sur le polling `/status/:jobId`).
 - **Sonde HTTP anti-SSRF** : les hôtes résolvant vers des adresses privées/internes ne sont pas contactés.
 - **Plafond de jobs concurrents** : 3 scans Sublist3r simultanés max, pour éviter l'épuisement de ressources.
 - **CORS restreint** à l'origine du Worker (configurable via `ALLOWED_ORIGINS`).

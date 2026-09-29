@@ -13,6 +13,7 @@ COPY package.json .
 RUN npm install --omit=dev
 
 COPY app.js .
+COPY subdomain-wordlist.txt .
 
 RUN groupadd -g 10001 appgroup && \
     useradd -u 10001 -g appgroup -M -s /usr/sbin/nologin appuser && \
