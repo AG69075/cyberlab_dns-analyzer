@@ -1,2 +1,30 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# VCS
+.git
+.gitignore
+
+# Dépendances (installées dans l'image)
 node_modules
-npm-debug.log
+npm-debug.log*
+
+# Sauvegardes
+backup
+backups
+*.bak
+*.orig
+app.js.pre-*
+
+# Logs
+*.log
+logs
+
+# Métadonnées Synology / macOS
+@eaDir
+.DS_Store
+
+# Docs
+README.md
